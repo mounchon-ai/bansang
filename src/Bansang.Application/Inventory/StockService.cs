@@ -4,6 +4,7 @@ using Bansang.Application.Contracts;
 using Bansang.Domain.Catalog;
 using Bansang.Domain.Common;
 using Bansang.Domain.Inventory;
+using Bansang.Domain.Sales;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Options;
 
@@ -256,6 +257,66 @@ public sealed class StockService(IAppDbContext db, ICurrentUser user, TimeProvid
         return m;
     }
 
+    // ---------- ใช้ร่วมกับ SalesService (ต้องอยู่ใน transaction ที่ล็อก SKU แล้ว) ----------
+
+    /// <summary>จองของให้บรรทัดขาย — แกะลังอัตโนมัติ / ขายติดลบ / ของหมด ตาม flowchart</summary>
+    internal async Task<AvailabilityPlan> ReserveForSaleAsync(SalesLine line, Guid locationId, string refDocument,
+        bool autoBreakBulk, CancellationToken ct)
+    {
+        EnsureInTransaction();
+        var scope = await LoadScopeAsync(line.SkuId!.Value, [locationId], ct);
+        var conv = new ConvertedQty(line.QtyBase, line.UnitName, line.Qty, line.FactorSnapshot!.Value, line.IsApproximate,
+            line.Form!.Value);
+        var (plan, allowNegative) = PrepareAvailability(scope, locationId, conv, autoBreakBulk, refDocument, []);
+        scope.Bucket(locationId, conv.Form).Reserve(conv.QtyBase, allowNegative);
+        return plan;
+    }
+
+    /// <summary>ของออกจากร้าน: ตัดจากของที่จองไว้ของบรรทัดนี้</summary>
+    internal async Task<StockMovement> IssueReservedAsync(SalesLine line, Guid locationId, decimal qty, decimal qtyBase,
+        string refDocument, CancellationToken ct)
+    {
+        EnsureInTransaction();
+        var scope = await LoadScopeAsync(line.SkuId!.Value, [locationId], ct);
+        return Post(scope.Bucket(locationId, line.Form!.Value), MovementType.Issue, -qtyBase,
+            SaleCtx(line, qty, refDocument, null) with { CostPerBase = scope.Sku.AvgCostPerBase }, consumeReserved: true);
+    }
+
+    internal async Task ReleaseReservedAsync(SalesLine line, Guid locationId, decimal qtyBase, CancellationToken ct)
+    {
+        EnsureInTransaction();
+        var scope = await LoadScopeAsync(line.SkuId!.Value, [locationId], ct);
+        scope.Bucket(locationId, line.Form!.Value).Release(qtyBase);
+    }
+
+    /// <summary>ลูกค้าคืนของ → movement Return เข้ากองตามสภาพของหน่วยที่ขาย</summary>
+    internal async Task<StockMovement> ReturnToStockAsync(SalesLine line, Guid locationId, decimal qty, decimal qtyBase,
+        string refDocument, string reason, CancellationToken ct)
+    {
+        EnsureInTransaction();
+        var scope = await LoadScopeAsync(line.SkuId!.Value, [locationId], ct);
+        return Post(scope.Bucket(locationId, line.Form!.Value), MovementType.Return, qtyBase,
+            SaleCtx(line, qty, refDocument, reason) with { CostPerBase = scope.Sku.AvgCostPerBase });
+    }
+
+    private MovementContext SaleCtx(SalesLine line, decimal qty, string refDocument, string? reason) => new()
+    {
+        InputUnit = line.UnitName,
+        InputQty = qty,
+        FactorSnapshot = line.FactorSnapshot,
+        IsApproximate = line.IsApproximate,
+        RefDocument = refDocument,
+        Reason = reason,
+        UserId = user.UserId,
+        At = clock.GetUtcNow(),
+    };
+
+    private void EnsureInTransaction()
+    {
+        if (db.Database.CurrentTransaction is null)
+            throw new InvalidOperationException("ต้องเรียกภายใน transaction ที่ล็อก SKU แล้ว (ผ่าน InLockAsync)");
+    }
+
     /// <summary>รันงานภายใต้ล็อก SKU — ถ้ามี transaction อยู่แล้ว (เรียกซ้อน) ใช้ตัวเดิม</summary>
     internal async Task<T> InLockAsync<T>(IEnumerable<Guid> skuIds, Func<Task<T>> work, CancellationToken ct)
     {
@@ -303,7 +364,9 @@ public sealed class StockService(IAppDbContext db, ICurrentUser user, TimeProvid
         if (missing != Guid.Empty) throw new NotFoundException("ที่เก็บ", missing);
         var inactive = locations.Values.FirstOrDefault(l => !l.IsActive);
         if (inactive is not null) throw new DomainException("location_inactive", $"ที่เก็บ '{inactive.Name}' ปิดใช้งานอยู่");
-        var buckets = await db.StockBuckets.Where(b => b.SkuId == skuId && locIds.Contains(b.LocationId)).ToListAsync(ct);
+        await db.StockBuckets.Where(b => b.SkuId == skuId && locIds.Contains(b.LocationId)).LoadAsync(ct);
+        // ใช้ Local เพื่อรวมกองที่เพิ่งสร้างใน transaction เดียวกัน (บิลเดียวหลายบรรทัด SKU เดียวกัน) — กันสร้างกองซ้ำ
+        var buckets = db.StockBuckets.Local.Where(b => b.SkuId == skuId && locIds.Contains(b.LocationId)).ToList();
         return new StockScope(db, sku, locations, buckets);
     }
 
@@ -312,8 +375,10 @@ public sealed class StockService(IAppDbContext db, ICurrentUser user, TimeProvid
         ConvertedQty conv, bool autoBreakBulk, string? refDocument, List<StockMovement> movements)
     {
         var target = scope.Bucket(locationId, conv.Form);
-        var sealedBucket = scope.Bucket(locationId, StockForm.Sealed);
-        var plan = AvailabilityPlanner.Plan(scope.Sku, conv, target.QtyAvailableBase, sealedBucket.QtyAvailableBase,
+        // อ่านยอดลังโดยไม่สร้างกองเปล่า (สินค้าหน่วยเดียวไม่มีกอง Sealed) — สร้างเมื่อแกะลังจริงเท่านั้น
+        var sealedAvailable = scope.Buckets.FirstOrDefault(b => b.LocationId == locationId && b.Form == StockForm.Sealed)
+            ?.QtyAvailableBase ?? 0;
+        var plan = AvailabilityPlanner.Plan(scope.Sku, conv, target.QtyAvailableBase, sealedAvailable,
             _opt.AllowNegativeStock);
 
         switch (plan.Status)

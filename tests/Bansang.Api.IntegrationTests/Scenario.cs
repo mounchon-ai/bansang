@@ -30,6 +30,26 @@ public sealed class Scenario(HttpClient http)
         return s;
     }
 
+    /// <summary>ใส่ราคาตะปู: kg 55 (ช่าง 50), ลัง 1150, ตัว 0.5</summary>
+    public async Task PriceNailAsync()
+    {
+        foreach (var p in new[]
+                 {
+                     new PriceInput("kg", CustomerTier.Retail, 0, 55), new PriceInput("kg", CustomerTier.Technician, 0, 50),
+                     new PriceInput("ลัง", CustomerTier.Retail, 0, 1150), new PriceInput("ตัว", CustomerTier.Retail, 0, 0.5m),
+                 })
+            await Http.PutOk<SkuDto>($"/api/skus/{SkuId}/prices", p);
+    }
+
+    /// <summary>สร้าง SKU หน่วยเดียว (เช่น ทรายถุง) พร้อมราคาปลีก</summary>
+    public async Task<Guid> SimpleSkuAsync(string name, string unit, decimal price)
+    {
+        var product = await Http.PostOk<ProductDto>("/api/products", new SaveProductRequest(name, null));
+        var sku = await Http.PostOk<SkuDto>("/api/skus", new CreateSkuRequest(product.Id, $"S-{Guid.NewGuid():N}"[..14], name, null,
+            unit, TrackingPattern.SingleUnit, Prices: [new PriceInput(unit, CustomerTier.Retail, 0, price)]));
+        return sku.Id;
+    }
+
     public Task<StockOperationResult> Receive(string unit, decimal qty, decimal unitCost = 900, Guid? location = null)
         => Http.PostOk<StockOperationResult>("/api/stock/receive",
             new ReceiveRequest(SkuId, location ?? Front, unit, qty, unitCost, "PO-TEST", null));

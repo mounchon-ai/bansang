@@ -39,6 +39,7 @@ app.MapGet("/health", () => Results.Ok(new { status = "ok" })).ExcludeFromDescri
 
 app.MapCatalog();
 app.MapInventory();
+app.MapSales();
 
 if (app.Configuration.GetValue("Database:MigrateOnStartup", true) || app.Configuration.GetValue("Database:Seed", false))
 {

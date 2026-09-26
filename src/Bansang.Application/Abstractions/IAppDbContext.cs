@@ -1,5 +1,6 @@
 using Bansang.Domain.Catalog;
 using Bansang.Domain.Inventory;
+using Bansang.Domain.Sales;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Infrastructure;
 
@@ -15,6 +16,9 @@ public interface IAppDbContext
     DbSet<StockMovement> StockMovements { get; }
     DbSet<StockCount> StockCounts { get; }
     DbSet<StockCountLine> StockCountLines { get; }
+    DbSet<Customer> Customers { get; }
+    DbSet<SalesOrder> SalesOrders { get; }
+    DbSet<Quotation> Quotations { get; }
 
     DatabaseFacade Database { get; }
 
@@ -25,4 +29,10 @@ public interface IAppDbContext
     /// กันสองเครื่อง POS ตัดกองเดียวกันพร้อมกัน ต้องเรียกภายใน transaction
     /// </summary>
     Task LockSkusAsync(IEnumerable<Guid> skuIds, CancellationToken ct = default);
+
+    /// <summary>ล็อกแถวบิลขาย กันยืนยัน/รับของ/ยกเลิกบิลเดียวกันพร้อมกัน ต้องเรียกภายใน transaction</summary>
+    Task LockSalesOrderAsync(Guid orderId, CancellationToken ct = default);
+
+    /// <summary>เลขลำดับถัดไปของ (prefix, งวด) — อยู่ใน transaction เดียวกับเอกสาร rollback แล้วเลขไม่ข้าม</summary>
+    Task<long> NextSequenceAsync(string prefix, string period, CancellationToken ct = default);
 }
