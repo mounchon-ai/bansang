@@ -1,0 +1,33 @@
+# ติดตั้งบนเครื่อง server ในร้าน (LAN) — POS / มือถือโกดัง / หลังบ้าน เรียกผ่าน http://<ip-เครื่อง>:8080
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: bansang
+      POSTGRES_USER: bansang
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-change-me}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U bansang -d bansang"]
+      interval: 5s
+      retries: 10
+
+  api:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      ConnectionStrings__Bansang: Host=db;Database=bansang;Username=bansang;Password=${DB_PASSWORD:-change-me}
+      Database__MigrateOnStartup: "true"
+      Database__Seed: ${SEED_DEMO_DATA:-false}
+      Inventory__AllowNegativeStock: ${ALLOW_NEGATIVE_STOCK:-false}
+      Inventory__CountVarianceThresholdPercent: ${COUNT_THRESHOLD_PERCENT:-3}
+    ports:
+      - "8080:8080"
+
+volumes:
+  pgdata:
